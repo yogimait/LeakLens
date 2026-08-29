@@ -1,0 +1,12 @@
+{
+    "comment":  "Known non-secrets: generated fixture values in tests/ and documented example formats in docs/prep/. See tests/leaklens.test.mjs fixture factory.",
+    "fingerprints":  [
+                         "stripe-secret-key:5158ca7bbf127535:tests/leaklens.test.mjs",
+                         "pem-private-key:dec643eed02d9698:docs/prep/credential-formats.md",
+                         "pem-private-key:8bcac7908eb95041:tests/leaklens.test.mjs",
+                         "connection-uri:2ec93543f072a658:tests/leaklens.test.mjs",
+                         "stripe-secret-key:bcb4f285da376d10:tests/leaklens.test.mjs",
+                         "connection-uri:982ea562a1d5bdc6:tests/leaklens.test.mjs",
+                         "generic-high-entropy:e46c5f49b5207127:tests/leaklens.test.mjs"
+                     ]
+}

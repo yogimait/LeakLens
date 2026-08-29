@@ -1,0 +1,11 @@
+{
+  "name": "leaklens",
+  "version": "0.1.0",
+  "description": "Git-aware secret scanner in one file of Node.js. Zero dependencies, no git binary, no network.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test"
+  }
+}

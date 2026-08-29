@@ -1,0 +1,6 @@
+# LF everywhere. The build normalises line endings anyway, so the reproducible
+# hash holds cross-platform — but a consistent checkout means the source a
+# reviewer reads on Windows is byte-for-byte what CI reads on Linux.
+* text=auto eol=lf
+*.png binary
+*.pdf binary
