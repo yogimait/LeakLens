@@ -167,39 +167,95 @@ function compileIgnorePattern(line) {
   return { regex, negated, dirOnly };
 }
 
-// Returns (relPosixPath, isDir) => ignored. Last matching pattern wins, which is
-// what lets a later "!keep.log" re-include a file an earlier "*.log" excluded.
-export function makeIgnore(patterns) {
+// Tri-state matcher: true = ignored, false = explicitly re-included by a "!"
+// rule, null = this file had no opinion. The third state is what lets a nested
+// .gitignore override a parent one only where it actually says something.
+export function makeIgnoreMatcher(patterns) {
   const rules = patterns.map(compileIgnorePattern).filter(Boolean);
   return (relPath, isDir) => {
-    let ignored = false;
+    let verdict = null;
     for (const rule of rules) {
       if (rule.dirOnly && !isDir) continue;
-      if (rule.regex.test(relPath)) ignored = !rule.negated;
+      if (rule.regex.test(relPath)) verdict = !rule.negated; // last match wins
     }
-    return ignored;
+    return verdict;
   };
 }
 
-// ponytail: root .gitignore only; nested .gitignore support if it ever matters
+// Boolean convenience wrapper: "no opinion" means "not ignored".
+export function makeIgnore(patterns) {
+  const match = makeIgnoreMatcher(patterns);
+  return (relPath, isDir) => match(relPath, isDir) === true;
+}
+
+function readIgnoreFile(filePath) {
+  try { return fs.readFileSync(filePath, "utf8").split(/\r?\n/); }
+  catch { return null; }
+}
+
+// Applies a stack of matchers, shallowest first. A deeper .gitignore wins over a
+// shallower one, but only for paths beneath it and only when it has an opinion.
+function isPathIgnored(matcherStack, relPath, isDir) {
+  let ignored = false;
+  for (const matcher of matcherStack) {
+    if (matcher.base && !relPath.startsWith(matcher.base + "/")) continue;
+    const relativeToMatcher = matcher.base ? relPath.slice(matcher.base.length + 1) : relPath;
+    const verdict = matcher.match(relativeToMatcher, isDir);
+    if (verdict !== null) ignored = verdict;
+  }
+  return ignored;
+}
+
+// Files scanned even when .gitignore excludes them. A .env is the single most
+// common home for a real credential, and "gitignored" is not "safe": the file is
+// still on disk, still in backups, still one `git add -f` from being committed.
+// Ignoring it because git does would defeat the point of the tool.
+const ALWAYS_SCAN = /(^|\/)\.env(\.|$)|(^|\/)credentials?\.|\.(pem|key|p12|pfx)$|(^|\/)id_(rsa|dsa|ecdsa|ed25519)$/i;
+
+// Iterative walk that honours .gitignore at every level, not just the root.
+// Nested files matter in practice: a Next.js project ignores .next/ from
+// dashboard/.gitignore, and reading only the root would scan build output.
 export function walkFiles(root, opts, notes) {
-  const patterns = [".git/"];
-  if (!opts.includeVendor) patterns.push("node_modules/", "vendor/", ".pnpm-store/");
-  const gitignorePath = path.join(root, ".gitignore");
-  try { patterns.push(...fs.readFileSync(gitignorePath, "utf8").split(/\r?\n/)); } catch {}
-  const isIgnored = makeIgnore(patterns);
+  const rootPatterns = [".git/"];
+  if (!opts.includeVendor) rootPatterns.push("node_modules/", "vendor/", ".pnpm-store/");
+  const rootIgnoreLines = readIgnoreFile(path.join(root, ".gitignore"));
+  if (rootIgnoreLines) rootPatterns.push(...rootIgnoreLines);
+
   const filePaths = [];
-  const pendingDirs = [""];
+  const pendingDirs = [{
+    dirRelPath: "",
+    matcherStack: [{ base: "", match: makeIgnoreMatcher(rootPatterns) }],
+  }];
+
   while (pendingDirs.length) {
-    const dirRelPath = pendingDirs.pop();
+    const { dirRelPath, matcherStack } = pendingDirs.pop();
+
+    // A .gitignore inside this directory applies to everything below it.
+    let stack = matcherStack;
+    if (dirRelPath) {
+      const nestedLines = readIgnoreFile(path.join(root, dirRelPath, ".gitignore"));
+      if (nestedLines) {
+        stack = [...matcherStack, { base: dirRelPath, match: makeIgnoreMatcher(nestedLines) }];
+      }
+    }
+
     let dirEntries;
     try { dirEntries = fs.readdirSync(path.join(root, dirRelPath), { withFileTypes: true }); }
     catch (err) { notes.push(`unreadable dir: ${dirRelPath || "."} (${err.code})`); continue; }
+
     for (const entry of dirEntries) {
       const entryRelPath = dirRelPath ? dirRelPath + "/" + entry.name : entry.name;
       if (entry.isSymbolicLink()) continue; // threat model: symlinks not followed
-      if (entry.isDirectory()) { if (!isIgnored(entryRelPath, true)) pendingDirs.push(entryRelPath); }
-      else if (entry.isFile()) { if (!isIgnored(entryRelPath, false)) filePaths.push(entryRelPath); }
+      if (entry.isDirectory()) {
+        if (!isPathIgnored(stack, entryRelPath, true)) {
+          pendingDirs.push({ dirRelPath: entryRelPath, matcherStack: stack });
+        }
+      } else if (entry.isFile()) {
+        const keepRegardless = ALWAYS_SCAN.test(entryRelPath);
+        if (keepRegardless || !isPathIgnored(stack, entryRelPath, false)) {
+          filePaths.push(entryRelPath);
+        }
+      }
     }
   }
   return filePaths.sort();
@@ -300,35 +356,6 @@ export function collectRefs(gitdir) {
   } catch {}
 
   return commitShas;
-}
-
-// ponytail: currently unused — GitStore.enumerate() finds unreachable objects
-// directly, which also works after "git reflog expire". Kept as a future source
-// of commit attribution for dangling blobs; delete if that never materialises.
-function collectReflogShas(gitdir) {
-  const reflogShas = new Set();
-  const pendingLogDirs = [path.join(gitdir, "logs")];
-  while (pendingLogDirs.length) {
-    const logDir = pendingLogDirs.pop();
-    let dirEntries;
-    try { dirEntries = fs.readdirSync(logDir, { withFileTypes: true }); } catch { continue; }
-    for (const entry of dirEntries) {
-      const entryPath = path.join(logDir, entry.name);
-      if (entry.isDirectory()) { pendingLogDirs.push(entryPath); continue; }
-      let logText;
-      try { logText = fs.readFileSync(entryPath, "utf8"); } catch { continue; }
-      for (const line of logText.split("\n")) {
-        // each reflog line starts "<old sha> <new sha> "
-        const transitionMatch = /^([0-9a-f]{40}) ([0-9a-f]{40}) /.exec(line);
-        if (transitionMatch) {
-          if (isSha(transitionMatch[1])) reflogShas.add(transitionMatch[1]);
-          if (isSha(transitionMatch[2])) reflogShas.add(transitionMatch[2]);
-        }
-      }
-    }
-  }
-  reflogShas.delete("0".repeat(40)); // the all-zero sha means "nothing before this"
-  return reflogShas;
 }
 
 // Pack object type codes, per gitformat-pack. Indexes 5 is reserved/unused.
@@ -888,7 +915,25 @@ export function isPlaceholder(value) {
   return false;
 }
 
-const CTX_SECRET = /(secret|token|passwd|password|api[_-]?key|apikey|credential|private[_-]?key|auth)/i;
+// Words that make a line "about" a credential. The lookarounds reject letters
+// on either side but allow "_" and "-", so "access_token" and "api-key" match
+// while "tokenizer", "unauthorized", and "author" do not. Plain  would fail
+// here: "_" is a word character, so token would miss "access_token".
+// Does this line talk about a credential? Two spellings, because one regex
+// cannot express both without false positives:
+//
+//   snake / kebab / standalone  api_key, API-KEY, "auth", token=
+//   camelCase                   apiSecret, authToken, dbPassword
+//
+// A plain \b fails here — "_" is a word character, so \btoken\b misses
+// "access_token" — and a plain substring match fires on "unauthorized",
+// "tokenizer", and "author", which is the false positive this replaced.
+const CTX_WORDS = "(secret|token|passwd|password|api[_-]?key|apikey|credential|private[_-]?key|authorization|auth)";
+const CTX_SNAKE = new RegExp(`(?<![A-Za-z])${CTX_WORDS}(?![A-Za-z])`, "i");
+// In camelCase the word starts with a capital, so a preceding lowercase letter
+// or digit *is* the boundary. Case-sensitive on purpose.
+const CTX_CAMEL = /(?<=[a-z0-9])(Secret|Token|Passwd|Password|ApiKey|Apikey|Credential|PrivateKey|Authorization|Auth)(?![a-z])/;
+const isSecretContext = (line) => CTX_SNAKE.test(line) || CTX_CAMEL.test(line);
 const CTX_DUMMY = /(example|dummy|sample|fake|mock|spec)/i;
 const LOCKFILES = new Set([
   "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "cargo.lock",
@@ -1188,7 +1233,7 @@ export function scanText(text, meta) {
     const lineText = lineIndex.lineText(lineNumber);
     if (!lineText || lineText.length > CONFIG.longLineSkip) continue; // minified or bundled
     if (/data:[^;]+;base64,/.test(lineText)) continue;                // embedded asset
-    if (!(CTX_SECRET.test(lineText) || isEnvLikeFile)) continue;      // no second signal
+    if (!(isSecretContext(lineText) || isEnvLikeFile)) continue;    // no second signal
 
     for (const match of lineText.matchAll(/[A-Za-z0-9+/=_-]{20,}/g)) {
       const candidate = match[0];
@@ -1631,7 +1676,7 @@ function findUpwards(startDir, fileName) {
 // Deterministic by construction: no timestamps, no hostname, no absolute paths,
 // no environment data. Same input bytes in, same output bytes out, on any
 // machine, forever. That is the whole requirement of a reproducible build.
-function buildSelf(outDirArg) {
+export function buildSelf(outDirArg, { silent = false } = {}) {
   const outDir = path.resolve(outDirArg ?? "dist");
   const rawSource = fs.readFileSync(SELF_PATH, "utf8");
 
@@ -1656,6 +1701,7 @@ function buildSelf(outDirArg) {
   // sha256sum format: hash, two spaces, filename
   fs.writeFileSync(path.join(outDir, "SHA256SUMS"), `${digest}  leaklens.mjs\n`);
 
+  if (silent) return { artifactPath, digest };
   process.stdout.write(
     `\n  ${c.bold("Build complete")}\n` +
     `    ${artifactPath}\n` +
@@ -1671,7 +1717,7 @@ function buildSelf(outDirArg) {
 // no way to reach the network or another process. Deliberately reads the source
 // rather than executing anything — LeakLens never spawns a subprocess, so it
 // cannot run `npm ls` on its own behalf. Run that separately; see README.
-function proveDependencies() {
+export function proveDependencies({ silent = false } = {}) {
   const source = fs.readFileSync(SELF_PATH, "utf8");
   const checks = [];
 
@@ -1720,7 +1766,7 @@ function proveDependencies() {
   lines.push(`  ${allPassed ? c.green("All checks passed.") : c.red("FAILED.")}`);
   lines.push(c.gray("  Complete the proof with:  npm ls --all   (expects an empty tree)"));
   lines.push("");
-  process.stdout.write(lines.join("\n"));
+  if (!silent) process.stdout.write(lines.join("\n"));
   return allPassed;
 }
 

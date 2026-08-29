@@ -154,7 +154,7 @@ flowchart TD
     CL --> V["runVerify"]
 ```
 
-`scanText` (`leaklens.mjs:1143`) is the only place secrets are found. Working-tree files and git
+`scanText` (`leaklens.mjs:1188`) is the only place secrets are found. Working-tree files and git
 blobs both arrive there as a string; everything else is plumbing.
 
 ### Reading git without git
@@ -163,23 +163,23 @@ Five passes over the object database, and the order is the point:
 
 | Pass | What it does | Code |
 |---|---|---|
-| 1 | Walk commits reachable from refs → blobs marked `reachable` | `leaklens.mjs:703` |
-| 2 | Collect HEAD's blobs → lets a finding say "still at HEAD" vs "removed" | `leaklens.mjs:736` |
-| 3 | Enumerate **every** object, find commits pass 1 never saw | `leaklens.mjs:610`, `leaklens.mjs:751` |
-| 4 | Walk those → blobs get paths and attribution, marked unreachable | `leaklens.mjs:759` |
-| 5 | Scan every blob, plus orphans nothing referenced | `leaklens.mjs:761` |
+| 1 | Walk commits reachable from refs → blobs marked `reachable` | `leaklens.mjs:730` |
+| 2 | Collect HEAD's blobs → lets a finding say "still at HEAD" vs "removed" | `leaklens.mjs:763` |
+| 3 | Enumerate **every** object, find commits pass 1 never saw | `leaklens.mjs:637`, `leaklens.mjs:778` |
+| 4 | Walk those → blobs get paths and attribution, marked unreachable | `leaklens.mjs:786` |
+| 5 | Scan every blob, plus orphans nothing referenced | `leaklens.mjs:788` |
 
 Pass 3 is what `git log -p` structurally cannot do, because `git log` only walks refs. Objects
 from amended, dropped, or rebased commits stay in `.git` and stay invisible to it.
 
 Reading a packed object means: `.idx` v2 fanout table → binary search of the sorted sha table
-(`leaklens.mjs:383`) → 4-byte offset with an MSB escape into the 8-byte large-offset table
-(`leaklens.mjs:366`) → object header varint → and for deltas, resolving the base and applying the
-copy/insert instruction stream (`leaklens.mjs:401`), with a depth cap and cycle detection so a
+(`leaklens.mjs:410`) → 4-byte offset with an MSB escape into the 8-byte large-offset table
+(`leaklens.mjs:393`) → object header varint → and for deltas, resolving the base and applying the
+copy/insert instruction stream (`leaklens.mjs:428`), with a depth cap and cycle detection so a
 hostile repository cannot hang the scan.
 
 SHA-1 appears here as **object addressing, never a security boundary**: we recompute it to confirm
-we read what git wrote, and refuse content that disagrees (`leaklens.mjs:585`).
+we read what git wrote, and refuse content that disagrees (`leaklens.mjs:612`).
 
 ### Detection
 
@@ -227,8 +227,9 @@ Track E requires this section, and it is the honest part of the pitch.
 ### Honest limits
 
 - **A clean scan is not proof of absence.** Detection is heuristic.
-- Only the repository root `.gitignore` is read; nested ones are not. Build output under an ignored
-  subdirectory can therefore be scanned, and occasionally produces a false positive.
+- `.gitignore` is honoured at every level, but credential-shaped files (`.env*`, `*.pem`, `*.key`,
+  `id_rsa`, `credentials.*`) are scanned **even when gitignored** — being ignored by git is not the
+  same as being safe. `--include-vendor` additionally scans `node_modules/` and `vendor/`.
 - Files over 5 MB and git objects over 10 MB are skipped — reported in the output, never silently.
 - 16 rules plus entropy. gitleaks ships 150+; trufflehog 800+.
 
@@ -280,8 +281,8 @@ embeds **no timestamp, no hostname, no absolute path, and no environment data**,
 the same source are byte-identical on any machine.
 
 ```
-dist/leaklens.mjs   84,625 bytes
-SHA-256             f7947d3d1e9617ea653f6af8bda7efc3ad1d5523401dc08f69d253af38ae9750
+dist/leaklens.mjs   86,868 bytes
+SHA-256             34c2fe5cf4ec02555f9f11aad4f8d457939119828218ed0ae77f34bd128a1631
 ```
 
 Both runs on this machine produced that hash; `cmp` reports the artifacts and `SHA256SUMS` identical.
@@ -294,14 +295,17 @@ as well as this one.
 node --test
 ```
 
-**32 tests, all passing.** They cover the argument parser and ignore matcher, every detection rule,
+**50 tests, all passing.** They cover the argument parser and ignore matcher, every detection rule,
 a false-positive corpus that must produce zero findings, delta application, the four zero-dependency
 proofs, and a self-scan asserting this repository has no critical findings.
 
-Seven use real `git` as a **test oracle** — fixtures F1–F6 build repositories with secrets in the
+Sixteen use real `git` as a **test oracle** — fixtures F1–F6 build repositories with secrets in the
 working tree, deleted from HEAD, amended away, `git gc`-packed, delta-compressed, and truncated —
-then assert LeakLens agrees. `git` is not a runtime dependency and is not imported; those tests skip
-cleanly when it is absent.
+then assert LeakLens agrees. A further set feeds deliberately hostile input — corrupt zlib streams,
+objects whose SHA-1 disagrees with their filename, truncated and unsupported pack indexes, garbage
+in the object directory, UTF-16, lone surrogates, 600 KB single lines — and asserts the scan records
+a note rather than crashing or silently skipping. `git` is not a runtime dependency and is not
+imported; those tests skip cleanly when it is absent.
 
 The headline test builds a repository, commits a secret, amends it away, asserts
 `git log --all -p` cannot see it, and asserts LeakLens can.
@@ -316,7 +320,7 @@ as the track requires.
 
 | Bonus | Claim |
 |---|---|
-| Single File | `leaklens.mjs` — 1,924 lines, the whole implementation including its own build command. No bundler, no build step to inspect |
+| Single File | `leaklens.mjs` — 1,970 lines, the whole implementation including its own build command. No bundler, no build step to inspect |
 | Reproducible Build | Two builds, byte-identical, hash published above |
 | Package Killer | `chalk` (319.8M/wk), `ignore` (~30M/wk), `glob` (~70M/wk), `minimist` (80.5M/wk), and `gitleaks` — see [STDLIB.md](STDLIB.md) |
 | STDLIB Log | 20 substitutions documented in [STDLIB.md](STDLIB.md) |

@@ -7,12 +7,13 @@ import assert from "node:assert";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import zlib from "node:zlib";
 import { execFileSync } from "node:child_process";
 
 import {
   parseArgv, makeIgnore, shannonEntropy, githubChecksum, validateGithubToken,
   awsAccountId, isPlaceholder, scanText, classify, scan, redact,
-  applyDelta, securityScore, looksBinary,
+  applyDelta, securityScore, looksBinary, walkFiles, buildSelf, proveDependencies,
 } from "../leaklens.mjs";
 
 // ---- fixture secret factory: fake entropy, valid checksums, never real ----
@@ -356,4 +357,228 @@ test("proof: implementation avoids Node-22-only APIs, so it runs on Node 20", ()
   for (const rx of [/fs\.globSync/, /styleText/, /util\.parseArgs/, /loadEnvFile/]) {
     assert.equal(rx.test(IMPL), false, `v22-only API used: ${rx}`);
   }
+});
+
+// ===== IGNORE SEMANTICS AND CONTEXT DETECTION =====
+// These lock in two behaviours that were wrong once and are easy to break again.
+
+test("ignore: nested .gitignore applies below its own directory", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "leaklens-nested-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 }));
+  fs.mkdirSync(path.join(dir, "app", "build"), { recursive: true });
+  fs.mkdirSync(path.join(dir, "other"), { recursive: true });
+  // only app/ ignores build output; other/ must be unaffected
+  fs.writeFileSync(path.join(dir, "app", ".gitignore"), "build/\n");
+  fs.writeFileSync(path.join(dir, "app", "build", "bundle.js"), "x\n");
+  fs.writeFileSync(path.join(dir, "app", "src.js"), "x\n");
+  fs.writeFileSync(path.join(dir, "other", "keep.js"), "x\n");
+
+  const walked = walkFiles(dir, scanOpts, []);
+  assert.ok(!walked.includes("app/build/bundle.js"), "nested .gitignore must exclude app/build");
+  assert.ok(walked.includes("app/src.js"));
+  assert.ok(walked.includes("other/keep.js"), "nested rule must not leak into sibling dirs");
+});
+
+test("ignore: a nested negation re-includes what a parent excluded", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "leaklens-neg-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 }));
+  fs.mkdirSync(path.join(dir, "pkg"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".gitignore"), "*.log\n");
+  fs.writeFileSync(path.join(dir, "pkg", ".gitignore"), "!keep.log\n");
+  fs.writeFileSync(path.join(dir, "drop.log"), "x\n");
+  fs.writeFileSync(path.join(dir, "pkg", "keep.log"), "x\n");
+
+  const walked = walkFiles(dir, scanOpts, []);
+  assert.ok(!walked.includes("drop.log"), "parent rule still applies where unopposed");
+  assert.ok(walked.includes("pkg/keep.log"), "deeper negation must win beneath its directory");
+});
+
+test("ignore: credential files are scanned even when gitignored", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "leaklens-env-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 }));
+  fs.mkdirSync(path.join(dir, "server"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".gitignore"), ".env\nserver/.env\n*.pem\nbuild/\n");
+  fs.writeFileSync(path.join(dir, "server", ".env"), `TOKEN=${ghpValid()}\n`);
+  fs.writeFileSync(path.join(dir, "key.pem"), "-----BEGIN RSA PRIVATE KEY-----\nMII\n");
+  fs.mkdirSync(path.join(dir, "build"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "build", "out.js"), "x\n");
+
+  const walked = walkFiles(dir, scanOpts, []);
+  // gitignored is not the same as safe: these are the files most likely to hold a real key
+  assert.ok(walked.includes("server/.env"), ".env must be scanned despite .gitignore");
+  assert.ok(walked.includes("key.pem"), ".pem must be scanned despite .gitignore");
+  assert.ok(!walked.includes("build/out.js"), "ordinary ignored build output stays ignored");
+
+  const found = scan(dir, scanOpts).findings;
+  assert.ok(found.some((f) => f.file === "server/.env" && f.rule === "github-token-classic"));
+});
+
+test("context: substrings of ordinary words do not create a secret context", () => {
+  const entropy = "zX9kQ2mP8vR4nB7jW3tY6uI1oL5eD0aS";
+  for (const word of ["unauthorized", "tokenizer", "author", "authored"]) {
+    assert.equal(classified(`const ${word} = "${entropy}";`).length, 0, `${word} must not fire`);
+  }
+});
+
+test("context: snake, kebab, upper and camel spellings all fire", () => {
+  const entropy = "zX9kQ2mP8vR4nB7jW3tY6uI1oL5eD0aS";
+  const contexts = [
+    `const access_token = "${entropy}";`,
+    `api-key: ${entropy}`,
+    `API_KEY=${entropy}`,
+    `Authorization: ${entropy}`,
+    `const apiSecret = "${entropy}";`,
+    `const authToken = "${entropy}";`,
+    `const dbPassword = "${entropy}";`,
+  ];
+  for (const line of contexts) {
+    assert.equal(classified(line).length, 1, `should fire: ${line}`);
+  }
+});
+
+// ===== HOSTILE INPUT =====
+// Every row of the F6 table in the design notes. A repository is attacker-
+// controlled input: the scan must degrade with a recorded note, never crash and
+// never silently skip. "No findings" and "could not read this" are different
+// answers, and the report has to distinguish them.
+
+// git marks loose objects and packfiles read-only; corruption tests chmod first.
+function overwrite(filePath, buf) {
+  fs.chmodSync(filePath, 0o644);
+  fs.writeFileSync(filePath, buf);
+}
+function eachLooseObject(dir, fn) {
+  const objectsDir = path.join(dir, ".git", "objects");
+  for (const prefix of fs.readdirSync(objectsDir)) {
+    if (!/^[0-9a-f]{2}$/.test(prefix)) continue;
+    for (const rest of fs.readdirSync(path.join(objectsDir, prefix))) {
+      fn(path.join(objectsDir, prefix, rest));
+    }
+  }
+}
+const historyOpts = { ...scanOpts, history: true };
+const tmpDir = (t, tag) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `leaklens-${tag}-`));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 }));
+  return dir;
+};
+
+test("hostile: directory that is not a repository", (t) => {
+  const dir = tmpDir(t, "norepo");
+  const result = scan(dir, historyOpts);
+  assert.deepEqual(result.findings, []);
+  assert.ok(result.notes.some((n) => n.includes("no .git")), "must say why history was skipped");
+});
+
+test("hostile: empty repo and bare repo", { skip: !hasGit }, (t) => {
+  assert.doesNotThrow(() => scan(tmpRepo(t), historyOpts));
+  const bare = tmpDir(t, "bare");
+  git(bare, "init", "-q", "--bare", "-b", "main");
+  assert.doesNotThrow(() => scan(bare, historyOpts));
+});
+
+test("hostile: .git file pointing at a missing gitdir", (t) => {
+  const dir = tmpDir(t, "gitfile");
+  fs.writeFileSync(path.join(dir, ".git"), "gitdir: /definitely/not/here\n");
+  assert.doesNotThrow(() => scan(dir, historyOpts));
+});
+
+test("hostile: HEAD points at a ref that does not exist", { skip: !hasGit }, (t) => {
+  const dir = tmpRepo(t);
+  fs.writeFileSync(path.join(dir, ".git", "HEAD"), "ref: refs/heads/nope\n");
+  assert.doesNotThrow(() => scan(dir, historyOpts));
+});
+
+test("hostile: corrupt zlib stream is noted, scan continues", { skip: !hasGit }, (t) => {
+  const dir = tmpRepo(t);
+  fs.writeFileSync(path.join(dir, "a.txt"), "hello\n");
+  git(dir, "add", "."); git(dir, "commit", "-qm", "one");
+  eachLooseObject(dir, (p) => overwrite(p, Buffer.from("not a zlib stream")));
+  const result = scan(dir, historyOpts);
+  assert.ok(result.notes.some((n) => n.includes("corrupt loose object")));
+});
+
+test("hostile: object whose SHA-1 disagrees with its path is not trusted", { skip: !hasGit }, (t) => {
+  const dir = tmpRepo(t);
+  fs.writeFileSync(path.join(dir, "a.txt"), "hello\n");
+  git(dir, "add", "."); git(dir, "commit", "-qm", "one");
+  let replaced = false;
+  eachLooseObject(dir, (p) => {
+    if (replaced) return;
+    // valid zlib, valid object header, wrong content for this filename
+    const header = Buffer.from("blob 5" + String.fromCharCode(0) + "WRONG");
+    overwrite(p, zlib.deflateSync(header));
+    replaced = true;
+  });
+  const result = scan(dir, historyOpts);
+  assert.ok(result.notes.some((n) => n.includes("sha mismatch")), "must refuse unverified content");
+});
+
+test("hostile: truncated pack index is skipped with a note", { skip: !hasGit }, (t) => {
+  const dir = tmpRepo(t);
+  fs.writeFileSync(path.join(dir, "a.txt"), "hello\n");
+  git(dir, "add", "."); git(dir, "commit", "-qm", "one");
+  git(dir, "gc", "-q");
+  const packDir = path.join(dir, ".git", "objects", "pack");
+  for (const f of fs.readdirSync(packDir)) {
+    if (!f.endsWith(".idx")) continue;
+    const p = path.join(packDir, f);
+    overwrite(p, fs.readFileSync(p).subarray(0, 100));
+  }
+  const result = scan(dir, historyOpts);
+  assert.ok(result.notes.some((n) => n.includes("pack index")), "unreadable index must be reported");
+});
+
+test("hostile: unsupported pack index version is declined clearly", { skip: !hasGit }, (t) => {
+  const dir = tmpRepo(t);
+  const packDir = path.join(dir, ".git", "objects", "pack");
+  fs.mkdirSync(packDir, { recursive: true });
+  const fake = Buffer.alloc(1032 + 40);
+  fake.writeUInt32BE(0xff744f63, 0); // correct magic
+  fake.writeUInt32BE(3, 4);          // a version we do not support
+  fs.writeFileSync(path.join(packDir, "pack-fake.idx"), fake);
+  const result = scan(dir, historyOpts);
+  assert.ok(result.notes.some((n) => /index version 3/.test(n)), "must name the unsupported version");
+});
+
+test("hostile: garbage in the loose object directory", { skip: !hasGit }, (t) => {
+  const dir = tmpRepo(t);
+  const sub = path.join(dir, ".git", "objects", "ab");
+  fs.mkdirSync(sub, { recursive: true });
+  fs.writeFileSync(path.join(sub, "c".repeat(38)), "not an object");
+  assert.doesNotThrow(() => scan(dir, historyOpts));
+});
+
+test("hostile: odd encodings and enormous lines do not crash", (t) => {
+  const dir = tmpDir(t, "enc");
+  const BOM = String.fromCharCode(0xfeff);
+  const LONE_SURROGATE = String.fromCharCode(0xd800);
+  fs.writeFileSync(path.join(dir, "utf16.txt"), Buffer.from(BOM + "password = secret", "utf16le"));
+  fs.writeFileSync(path.join(dir, "crlf.txt"), 'line1\r\napi_key = "' + LONE_SURROGATE + 'abc"\r\n');
+  fs.writeFileSync(path.join(dir, "min.js"), "var x=" + "a".repeat(600_000) + ";");
+  fs.writeFileSync(path.join(dir, "--history"), "password = hunter2\n"); // filename looks like a flag
+  assert.doesNotThrow(() => scan(dir, scanOpts));
+});
+
+test("hostile: malformed .gitignore lines are tolerated", (t) => {
+  const dir = tmpDir(t, "badignore");
+  fs.writeFileSync(path.join(dir, ".gitignore"), "\n\n#c\n!\n[\n***\n   \n[a-\n");
+  fs.writeFileSync(path.join(dir, "a.txt"), "hello\n");
+  assert.doesNotThrow(() => walkFiles(dir, scanOpts, []));
+});
+
+// ===== BUILD AND PROOF =====
+
+test("build: two builds of the same source are byte-identical", (t) => {
+  const dir = tmpDir(t, "build");
+  const first = buildSelf(path.join(dir, "a"), { silent: true });
+  const second = buildSelf(path.join(dir, "b"), { silent: true });
+  assert.equal(first.digest, second.digest, "the build must embed no timestamp, path, or host");
+  assert.deepEqual(fs.readFileSync(first.artifactPath), fs.readFileSync(second.artifactPath));
+  // and the artifact must be a real module, not a truncated copy
+  assert.match(fs.readFileSync(first.artifactPath, "utf8"), /export function scanText/);
+});
+
+test("proof: the dependency audit passes on our own source", () => {
+  assert.equal(proveDependencies({ silent: true }), true);
 });
