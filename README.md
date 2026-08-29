@@ -263,6 +263,9 @@ a process at all — which is the thing being proven.
 The same claims are enforced as tests, so they fail the build rather than merely being asserted in
 this README — see the four `proof:` cases in `tests/leaklens.test.mjs`.
 
+CI runs all of the above on every push, on Node 20 and 22, so the proof is a public log rather than
+a claim: [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
 ## Reproducible build
 
 One command, no bundler, no build step to inspect:
@@ -282,6 +285,8 @@ SHA-256             f7947d3d1e9617ea653f6af8bda7efc3ad1d5523401dc08f69d253af38ae
 ```
 
 Both runs on this machine produced that hash; `cmp` reports the artifacts and `SHA256SUMS` identical.
+CI repeats the two-build comparison on every push, so reproducibility is verified on a clean machine
+as well as this one.
 
 ## Tests
 

@@ -1,0 +1,73 @@
+name: CI
+
+# Public evidence for three claims the README makes:
+#   1. zero dependencies      — an empty npm tree plus a static source audit
+#   2. reproducible build     — two builds, byte-identical
+#   3. runs on Node 20        — the matrix, not just an assertion in a doc
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test on Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Node version
+        run: node -v
+
+      - name: Dependency proof — empty install tree
+        run: npm ls --all
+
+      - name: Dependency proof — static source audit
+        run: node leaklens.mjs --prove
+
+      - name: Tests
+        run: node --test
+
+      - name: Scan our own repository
+        # The baseline holds fingerprints for deliberate test fixtures.
+        # Anything else found here fails the build.
+        run: node leaklens.mjs . --baseline .leaklens-baseline.json
+
+  reproducible-build:
+    name: Reproducible build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: First build
+        run: |
+          node leaklens.mjs --build
+          cp dist/leaklens.mjs first-leaklens.mjs
+          cp dist/SHA256SUMS first-SHA256SUMS
+          rm -rf dist
+
+      - name: Second build
+        run: node leaklens.mjs --build
+
+      - name: Compare — must be byte-identical
+        run: |
+          cmp first-leaklens.mjs dist/leaklens.mjs
+          cmp first-SHA256SUMS dist/SHA256SUMS
+          echo "Two independent builds produced identical bytes:"
+          cat dist/SHA256SUMS
+
+      - name: Built artifact is runnable
+        run: node dist/leaklens.mjs --prove
