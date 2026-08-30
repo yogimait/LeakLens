@@ -15,7 +15,9 @@ import {
   parseArgv, makeIgnore, shannonEntropy, githubChecksum, validateGithubToken,
   awsAccountId, isPlaceholder, scanText, classify, scan, redact,
   applyDelta, securityScore, looksBinary, walkFiles, buildSelf, proveDependencies,
+  RULES,
 } from "../leaklens.mjs";
+import { SECRETS } from "./fixtures.mjs";
 
 // ---- fixture secret factory: fake entropy, valid checksums, never real ----
 
@@ -638,4 +640,52 @@ test("patch guard: writes the patch when --out is outside any repository", { ski
   assert.match(result.stderr, /do not commit/i, "must warn that the patch holds cleartext secrets");
   // the patch necessarily contains the secret; that is why the guard exists
   assert.match(fs.readFileSync(patchPath, "utf8"), /process\.env\.GITHUB_TOKEN/);
+});
+
+// ===== PER-RULE DETECTION =====
+// One case per shipped rule. The fixture credentials are assembled from
+// fragments in fixtures.mjs, so no key-shaped literal reaches the repository.
+
+const ruleCases = [
+  ["github-pat-fine-grained", "critical", (s) => `const t = "${s.githubFineGrained}";`],
+  ["aws-secret-access-key", "critical", (s) => `aws_secret_access_key = "${s.awsSecret}"`],
+  ["slack-token", "high", (s) => `const bot = "${s.slackToken}";`],
+  ["slack-webhook", "medium", (s) => `const url = "${s.slackWebhook}";`],
+  ["google-api-key", "medium", (s) => `const key = "${s.googleApiKey}";`],
+  ["anthropic-api-key", "critical", (s) => `const key = "${s.anthropicKey}";`],
+  ["openai-api-key", "critical", (s) => `const key = "${s.openaiKey}";`],
+  ["npm-token", "high", (s) => `const t = "${s.npmToken}";`],
+  ["sendgrid-api-key", "high", (s) => `const key = "${s.sendgridKey}";`],
+  ["twilio-api-key", "high", (s) => `const sid = "${s.twilioKey}";`],
+];
+
+for (const [ruleId, expectedSeverity, makeLine] of ruleCases) {
+  test(`rule ${ruleId}: fires with severity ${expectedSeverity}`, () => {
+    const hits = classified(makeLine(SECRETS), "src/providers.js");
+    const hit = hits.find((f) => f.rule === ruleId);
+    assert.ok(hit, `${ruleId} did not fire on its own sample`);
+    assert.equal(hit.severity, expectedSeverity);
+    assert.ok(!hit.redacted.includes(hit.value), "the finding must carry a redacted form");
+  });
+}
+
+test("every rule ships a remediation path", () => {
+  // The submission checklist says no rule ships without a fix path. This is the
+  // check that keeps that true as rules are added.
+  const incomplete = RULES.filter((rule) =>
+    !Array.isArray(rule.advice) || rule.advice.length === 0 ||
+    !rule.reference || !rule.severity || rule.envName === undefined);
+  assert.deepEqual(incomplete.map((r) => r.id), [], "rules missing advice, reference, severity or envName");
+});
+
+test("every rule id is unique and kebab-case", () => {
+  const ids = RULES.map((r) => r.id);
+  assert.equal(new Set(ids).size, ids.length, "duplicate rule id");
+  for (const id of ids) assert.match(id, /^[a-z0-9]+(-[a-z0-9]+)*$/, `not kebab-case: ${id}`);
+});
+
+test("every rule pattern is global, or matchAll would throw", () => {
+  for (const rule of RULES) {
+    assert.ok(rule.pattern.global, `${rule.id} pattern must carry the g flag`);
+  }
 });

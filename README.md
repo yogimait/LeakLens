@@ -295,11 +295,16 @@ as well as this one.
 node --test
 ```
 
-**52 tests, all passing.** They cover the argument parser and ignore matcher, every detection rule,
+`tests/leaklens.test.mjs` covers the internals by importing them. `tests/e2e.test.mjs` runs the
+real binary as a subprocess against purpose-built repositories from `tests/fixtures.mjs` — 29 cases
+covering every detection rule, all three output formats, every exit code, the verify loop, the
+remediation guard, and the reproducible build.
+
+**94 tests, all passing.** They cover the argument parser and ignore matcher, every detection rule,
 a false-positive corpus that must produce zero findings, delta application, the four zero-dependency
 proofs, and a self-scan asserting this repository has no critical findings.
 
-Sixteen use real `git` as a **test oracle** — fixtures F1–F6 build repositories with secrets in the
+Many use real `git` as a **test oracle** — fixtures F1–F6 build repositories with secrets in the
 working tree, deleted from HEAD, amended away, `git gc`-packed, delta-compressed, and truncated —
 then assert LeakLens agrees. A further set feeds deliberately hostile input — corrupt zlib streams,
 objects whose SHA-1 disagrees with their filename, truncated and unsupported pack indexes, garbage
