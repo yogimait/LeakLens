@@ -281,8 +281,8 @@ embeds **no timestamp, no hostname, no absolute path, and no environment data**,
 the same source are byte-identical on any machine.
 
 ```
-dist/leaklens.mjs   86,868 bytes
-SHA-256             34c2fe5cf4ec02555f9f11aad4f8d457939119828218ed0ae77f34bd128a1631
+dist/leaklens.mjs   86,877 bytes
+SHA-256             662f85fa383901693a046ecbe5d7843f9b4aa87d5477ffe93d82e9de516d8d4d
 ```
 
 Both runs on this machine produced that hash; `cmp` reports the artifacts and `SHA256SUMS` identical.
@@ -295,7 +295,7 @@ as well as this one.
 node --test
 ```
 
-**50 tests, all passing.** They cover the argument parser and ignore matcher, every detection rule,
+**52 tests, all passing.** They cover the argument parser and ignore matcher, every detection rule,
 a false-positive corpus that must produce zero findings, delta application, the four zero-dependency
 proofs, and a self-scan asserting this repository has no critical findings.
 

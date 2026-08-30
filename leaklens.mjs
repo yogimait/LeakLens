@@ -1936,7 +1936,7 @@ async function main() {
         process.stderr.write(
           `\n  ${c.red(c.bold("refusing to write the patch"))}\n` +
           `  ${patchPath}\n` +
-          `  is inside a git repository (${repo}).\n` +
+          `  is inside a git repository (${enclosingRepo}).\n` +
           `  The patch contains cleartext secrets and must not be committed.\n` +
           `  Pass --out with a directory outside any repository, e.g. --out ${path.join(systemTempDir(), "leaklens")}\n\n`,
         );

@@ -9,6 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
 import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import {
   parseArgv, makeIgnore, shannonEntropy, githubChecksum, validateGithubToken,
@@ -581,4 +582,60 @@ test("build: two builds of the same source are byte-identical", (t) => {
 
 test("proof: the dependency audit passes on our own source", () => {
   assert.equal(proveDependencies({ silent: true }), true);
+});
+
+// ===== PATCH GUARD =====
+// The refusal path lives in main() and ends in process.exit, so it has to be
+// exercised as a real process. It went untested once and drifted into a
+// ReferenceError that only fired when a user did the right thing and pointed
+// --out somewhere unsafe. A security guard that crashes is a guard that failed.
+
+const IMPL_PATH = fileURLToPath(new URL("../leaklens.mjs", import.meta.url));
+
+function runCli(args, cwd) {
+  try {
+    const stdout = execFileSync(process.execPath, [IMPL_PATH, ...args], {
+      cwd, env: { ...process.env, NO_COLOR: "1" }, stdio: "pipe",
+    });
+    return { status: 0, stdout: stdout.toString(), stderr: "" };
+  } catch (err) {
+    return {
+      status: err.status,
+      stdout: (err.stdout ?? "").toString(),
+      stderr: (err.stderr ?? "").toString(),
+    };
+  }
+}
+
+test("patch guard: refuses to write a secret-bearing patch inside a git repo", { skip: !hasGit }, (t) => {
+  const repo = tmpRepo(t);
+  fs.writeFileSync(path.join(repo, "config.js"), `const token = "${ghpValid()}";\n`);
+  git(repo, "add", "."); git(repo, "commit", "-qm", "add config");
+
+  // --out points at the scanned repository itself: the worst possible destination
+  const result = runCli([repo, "--remediate-patch", "--out", repo], repo);
+
+  assert.equal(result.status, 2, "must exit with a usage error, not crash");
+  assert.match(result.stderr, /refusing to write the patch/);
+  assert.match(result.stderr, /is inside a git repository/);
+  assert.ok(!/ReferenceError|is not defined/.test(result.stderr), "the guard itself must not throw");
+  // it names the offending repository so the user knows what to change
+  assert.ok(result.stderr.includes(repo), "must name the repository it refused to write into");
+  assert.ok(!fs.existsSync(path.join(repo, "leaklens-fix.patch")), "no patch may be left behind");
+});
+
+test("patch guard: writes the patch when --out is outside any repository", { skip: !hasGit }, (t) => {
+  const repo = tmpRepo(t);
+  fs.writeFileSync(path.join(repo, "config.js"), `const token = "${ghpValid()}";\n`);
+  git(repo, "add", "."); git(repo, "commit", "-qm", "add config");
+  const outside = tmpDir(t, "patch-out"); // a plain temp dir, not a repo
+
+  const result = runCli([repo, "--remediate-patch", "--out", outside], outside);
+
+  assert.equal(result.status, 1, "findings present, so exit 1");
+  const patchPath = path.join(outside, "leaklens-fix.patch");
+  assert.ok(fs.existsSync(patchPath), "the patch should be written when the destination is safe");
+  assert.match(result.stderr, /do not commit/i, "must warn that the patch holds cleartext secrets");
+  // the patch necessarily contains the secret; that is why the guard exists
+  assert.match(fs.readFileSync(patchPath, "utf8"), /process\.env\.GITHUB_TOKEN/);
 });
