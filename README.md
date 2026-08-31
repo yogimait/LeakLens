@@ -219,7 +219,7 @@ Track E requires this section, and it is the honest part of the pitch.
 | Out of scope | Confirming a credential is live — **zero network calls**, so LeakLens is safe offline, in CI, and during incident response |
 | Crypto | None invented. SHA-1 (git object identity), SHA-256 (fingerprints, build hashes), CRC32 (token checksums), all from `node:crypto` / `node:zlib`. Compose, never invent |
 | Output | Findings redacted by default; `--unsafe-show-secrets` is opt-in because scanner output lands in CI logs |
-| Untrusted input | Repositories are attacker-controlled. Parsers are length-bounded, delta chains depth-capped and cycle-checked, tree entry names can never resolve to real paths, symlinks are not followed |
+| Untrusted input | Repositories are attacker-controlled. Parsers are length-bounded, a declared inflated size over 10 MB is refused **before** allocation so a decompression bomb is never expanded, delta chains are depth-capped and cycle-checked, tree entry names can never resolve to real paths, symlinks are not followed |
 | Remediation | Advisory only. LeakLens never revokes, rotates, rewrites files, or rewrites history. History-cleanup commands are printed, never executed |
 | Patch files | A unified diff necessarily contains the secret in cleartext. Written mode `0600`, behind a second explicit flag, and **refused if the destination is inside any git repository** — "outside the scan root" is not the same as "safe" |
 | Verify honesty | `--verify` proves the literal left the tree and the blob left the object database. It **cannot** prove the credential was rotated, so it says so instead of scoring 100/100 |
@@ -230,7 +230,10 @@ Track E requires this section, and it is the honest part of the pitch.
 - `.gitignore` is honoured at every level, but credential-shaped files (`.env*`, `*.pem`, `*.key`,
   `id_rsa`, `credentials.*`) are scanned **even when gitignored** — being ignored by git is not the
   same as being safe. `--include-vendor` additionally scans `node_modules/` and `vendor/`.
-- Files over 5 MB and git objects over 10 MB are skipped — reported in the output, never silently.
+- Content over 5 MB is skipped — a working-tree file or a git blob alike — and always reported in
+  the output, never silently. The separate 10 MB object cap is not a scan limit but a decompression
+  guard: a packed object whose header *declares* a larger inflated size is refused before a byte is
+  allocated (`leaklens.mjs:543`), so a bomb is never expanded to discover how big it was.
 - 16 rules plus entropy. gitleaks ships 150+; trufflehog 800+.
 
 ## Zero-dependency proof
@@ -300,9 +303,11 @@ real binary as a subprocess against purpose-built repositories from `tests/fixtu
 covering every detection rule, all three output formats, every exit code, the verify loop, the
 remediation guard, and the reproducible build.
 
-**94 tests, all passing.** They cover the argument parser and ignore matcher, every detection rule,
+**95 tests, all passing.** They cover the argument parser and ignore matcher, every detection rule,
 a false-positive corpus that must produce zero findings, delta application, the four zero-dependency
-proofs, and a self-scan asserting this repository has no critical findings.
+proofs, and a self-scan asserting this repository has no critical findings. Each refusal the threat
+model names above is asserted by a test, not assumed: an untested guard is a guard that has never
+actually run.
 
 Many use real `git` as a **test oracle** — fixtures F1–F6 build repositories with secrets in the
 working tree, deleted from HEAD, amended away, `git gc`-packed, delta-compressed, and truncated —

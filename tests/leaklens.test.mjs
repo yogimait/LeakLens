@@ -201,6 +201,45 @@ test("applyDelta: copy + insert + guards", () => {
   assert.throws(() => applyDelta(Buffer.from("x"), Buffer.from([5, 1, 0x00])), /size mismatch|reserved/);
 });
 
+// The threat model advertises these four refusals by name. A hostile repository
+// is the input this parser is built for, so each one is asserted rather than
+// assumed — an untested guard is a guard that has never actually run.
+test("applyDelta: refuses hostile deltas", () => {
+  const varint = (size) => {
+    const bytes = [];
+    do { let byte = size % 128; size = Math.floor(size / 128); if (size) byte |= 0x80; bytes.push(byte); } while (size);
+    return bytes;
+  };
+  const base = Buffer.from("hello world, hello git");
+  const header = (resultSize) => [...varint(base.length), ...varint(resultSize)];
+
+  // Decompression bomb. 1 TiB would also fail inside Buffer.allocUnsafe, so
+  // matching *our* message proves the cap ran first and nothing was allocated.
+  assert.throws(
+    () => applyDelta(base, Buffer.from(header(2 ** 40))),
+    /delta target over size cap/,
+  );
+
+  // COPY reaching past the base must not read whatever lies beyond it.
+  assert.throws(
+    () => applyDelta(base, Buffer.from([...header(4), 0x91, 0x00, 0xff])),
+    /delta copy out of range/,
+  );
+
+  // Opcode 0 is reserved, not a zero-length insert to be skipped over.
+  assert.throws(
+    () => applyDelta(base, Buffer.from([...header(4), 0x00])),
+    /delta reserved opcode 0/,
+  );
+
+  // A stream that stops early must fail, never return a half-filled buffer:
+  // allocUnsafe does not zero its memory.
+  assert.throws(
+    () => applyDelta(base, Buffer.from([...header(99), 4, 0x67, 0x69, 0x74, 0x21])),
+    /delta result size mismatch/,
+  );
+});
+
 test("binary sniff", () => {
   assert.equal(looksBinary(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x0d])), true);
   assert.equal(looksBinary(Buffer.from("plain text\n")), false);
