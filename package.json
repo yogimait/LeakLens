@@ -6,6 +6,8 @@
   "license": "MIT",
   "engines": { "node": ">=20" },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "build": "node leaklens.mjs --build",
+    "prove": "node leaklens.mjs --prove"
   }
 }

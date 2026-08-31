@@ -47,6 +47,16 @@ git clone <repo> && cd leaklens
 node leaklens.mjs --help
 ```
 
+There is nothing to install because there is nothing to install *from* — but the conventional
+commands exist and each is one command:
+
+| Command | Does |
+|---|---|
+| `npm run build` | Produces `dist/leaklens.mjs` + `SHA256SUMS`. Run twice, compare — byte-identical |
+| `npm test` | 95 unit tests + 29 end-to-end cases, `node:test` only |
+| `npm run prove` | Static proof of zero dependencies over our own source |
+| `npm ls --all` | Empty tree — the other half of the proof |
+
 ## Usage
 
 Every flag belongs to one of four stages — the tool is this pipeline:
